@@ -78,8 +78,17 @@ mouli
   Prérequis        : 2/2
 
   Détails des compétences & tests :
-   [✓ PASS  ] Basics tests                       10/10 (100%)
-   [~ PARTIEL] Edge cases & Large files           8/10 ( 80%)
+
+  head - Part 01 (1/1)
+    [✓ PASS ] head - Basic tests (no options, file in parameter and stdin)
+
+  head - Part 02 (0/1)
+    [✗ KO   ] head - Error handling
+             ↳ KO: Test failed: invalid output.
+
+  head - Part 03 (0/1)
+    [✗ KO   ] head - Option -c/--bytes
+             ↳ KO: Test failed: invalid exit status. Got 84.
 ```
 
 ---
@@ -123,6 +132,7 @@ mouli stumper
 
 | Commande | Description |
 | :--- | :--- |
+| `mouli update` | Met à jour MouliResult CLI vers la dernière version |
 | `mouli login <token>` | Met à jour le `refresh_token` |
 | `mouli --year 2025` | Change l'année académique ciblée |
 | `mouli --raw` | Sort le JSON brut de l'API (pratique pour vos scripts ou `jq`) |
@@ -141,10 +151,11 @@ mouli stumper
 ## 🔄 Mise à jour & Désinstallation
 
 ### Mettre à jour `mouli`
-Relancez simplement la commande d'installation :
+Pour mettre à jour MouliResult CLI, lancez simplement :
 ```bash
-curl -fsSL https://raw.githubusercontent.com/foundhack/mouli/main/install.sh | bash
+mouli update
 ```
+*(ou relancez la commande d'installation curl)*
 
 ### Désinstaller `mouli`
 Pour supprimer le binaire et (optionnellement) sa configuration :

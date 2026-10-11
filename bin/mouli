@@ -181,6 +181,16 @@ def fetch_moulinette_results(cfg: dict) -> list:
         return results
     return []
 
+def fetch_result_detail(cfg: dict, run_id: int) -> dict:
+    if not run_id:
+        return {}
+    acc = get_valid_access_token(cfg)
+    url = f"https://my.epitech.eu/api/students/test-results/{run_id}"
+    status, resp = make_request(url, headers={"Authorization": f"Bearer {acc}"})
+    if status == 200 and isinstance(resp, dict):
+        return resp
+    return {}
+
 # ============================================================
 #  FORMATTAGE GRAPHIQUE CLI
 # ============================================================
@@ -224,13 +234,14 @@ def format_date_relative(iso_str: str) -> str:
     except Exception:
         return iso_str
 
-def display_single_result(res: dict, detailed: bool = True):
+def display_single_result(res: dict, detailed: bool = True, cfg: dict = None):
     ctx = res.get("context", {})
     prop = res.get("properties", {})
     skills = res.get("skillBreakdowns", {})
     style = res.get("codingStyle")
     prereq = res.get("prerequisitesMark", None)
     failure_flags = res.get("failureFlags", [])
+    run_id = res.get("id")
 
     title = ctx.get("title") or ctx.get("projectCode") or "Projet inconnu"
     project_code = ctx.get("projectCode", "")
@@ -310,41 +321,128 @@ def display_single_result(res: dict, detailed: bool = True):
         print(f"  {C.BOLD}Alertes Crash    :{C.RESET} {C.BG_RED}{C.WHITE} {crashed_tests} CRASH(S) DÉTECTÉ(S) {C.RESET}")
 
     # Détails des tests
-    if detailed and skills:
-        print()
-        print(f"  {C.BOLD}{C.UNDER}Détails des compétences & tests :{C.RESET}")
-        for task_name, task_data in skills.items():
-            if not isinstance(task_data, dict):
-                continue
-            t_count = task_data.get("count", 0)
-            t_pass = task_data.get("passed", 0)
-            t_crash = task_data.get("crashed", 0)
-            t_mand = task_data.get("mandatoryFailed", 0)
+    if detailed:
+        detail_data = None
+        if cfg and run_id:
+            try:
+                detail_data = fetch_result_detail(cfg, run_id)
+            except Exception:
+                detail_data = None
 
-            t_pct = (t_pass / t_count * 100.0) if t_count > 0 else 0
-            if t_crash > 0:
-                badge = f"{C.RED}💥 CRASH{C.RESET}"
-            elif t_pass == t_count and t_count > 0:
-                badge = f"{C.GREEN}✓ PASS  {C.RESET}"
-            elif t_pass > 0:
-                badge = f"{C.YELLOW}~ PARTIEL{C.RESET}"
-            else:
-                badge = f"{C.RED}✗ ÉCHEC {C.RESET}"
+        # Affichage d'erreur de compilation brute si présente
+        if detail_data and detail_data.get("makeError"):
+            print(f"\n  {C.RED}{C.BOLD}⚙️  Trace d'erreur de compilation (Make) :{C.RESET}")
+            lines = detail_data["makeError"].strip().split("\n")
+            for l in lines[:12]:
+                print(f"    {C.GRAY}{l}{C.RESET}")
+            if len(lines) > 12:
+                print(f"    {C.GRAY}... (tronqué, {len(lines) - 12} lignes supplémentaires){C.RESET}")
 
-            extra = ""
-            if t_crash > 0:
-                extra += f" {C.RED}({t_crash} crash){C.RESET}"
-            if t_mand > 0:
-                extra += f" {C.RED}(bloquant){C.RESET}"
+        # Affichage des sous-tests avec raisons réelles de la moulinette
+        skills_report = detail_data.get("skills", []) if detail_data else []
+        if skills_report:
+            print()
+            print(f"  {C.BOLD}{C.UNDER}Rapport détaillé des tests :{C.RESET}")
+            for sk in skills_report:
+                if "FullSkillReport" in sk or "tests" in (sk.get("FullSkillReport") or sk):
+                    rep = sk.get("FullSkillReport") or sk
+                    cat_name = rep.get("name", "Compétence")
+                    tests = rep.get("tests", [])
+                    t_count = len(tests)
+                    t_passed = sum(1 for t in tests if t.get("passed"))
+                    t_crashed = sum(1 for t in tests if t.get("crashed"))
 
-            clean_name = task_name[:34].ljust(34)
-            print(f"   [{badge}] {clean_name} {t_pass:2d}/{t_count:2d} ({t_pct:3.0f}%){extra}")
-    elif detailed and not skills:
-        if "make-error" in failure_flags:
-            print(f"\n  {C.YELLOW}ℹ️  Aucun détail de test disponible : la moulinette a échoué à l'étape 'make'.{C.RESET}")
-            print(f"  {C.GRAY}   Vérifiez vos fichiers C, headers (.h) et Makefile puis repoussez un commit.{C.RESET}")
+                    cat_color = C.GREEN if (t_passed == t_count and t_count > 0) else (C.YELLOW if t_passed > 0 else C.RED)
+                    print(f"\n  {C.BOLD}{cat_name}{C.RESET} ({cat_color}{t_passed}/{t_count}{C.RESET})")
+
+                    for t in tests:
+                        t_name = t.get("name", "Test")
+                        is_pass = t.get("passed", False)
+                        is_crash = t.get("crashed", False)
+                        is_mand = t.get("mandatory", False)
+                        comment = t.get("comment", "")
+
+                        if is_crash:
+                            badge = f"{C.BG_RED}{C.WHITE} CRASH {C.RESET}"
+                        elif is_pass:
+                            badge = f"{C.GREEN}✓ PASS {C.RESET}"
+                        else:
+                            badge = f"{C.RED}✗ KO   {C.RESET}"
+
+                        extra_badge = f" {C.RED}(bloquant){C.RESET}" if (is_mand and not is_pass) else ""
+                        print(f"    [{badge}] {t_name}{extra_badge}")
+
+                        # Afficher la raison exacte de la moulinette sans rien inventer
+                        if (not is_pass or is_crash) and comment and comment != "PASSED":
+                            for c_line in comment.strip().split("\n"):
+                                c_line_clean = c_line.strip()
+                                if c_line_clean:
+                                    print(f"             {C.YELLOW}↳ {c_line_clean}{C.RESET}")
+
+                elif "BreakdownSkillReport" in sk:
+                    rep = sk["BreakdownSkillReport"]
+                    cat_name = rep.get("name", "Compétence")
+                    brk = rep.get("breakdown", {})
+                    t_count = brk.get("count", 0)
+                    t_pass = brk.get("passed", 0)
+                    t_crash = brk.get("crashed", 0)
+                    t_mand = brk.get("mandatoryFailed", 0)
+                    t_pct = (t_pass / t_count * 100.0) if t_count > 0 else 0
+
+                    if t_crash > 0:
+                        badge = f"{C.RED}💥 CRASH{C.RESET}"
+                    elif t_pass == t_count and t_count > 0:
+                        badge = f"{C.GREEN}✓ PASS  {C.RESET}"
+                    elif t_pass > 0:
+                        badge = f"{C.YELLOW}~ PARTIEL{C.RESET}"
+                    else:
+                        badge = f"{C.RED}✗ ÉCHEC {C.RESET}"
+
+                    extra = ""
+                    if t_crash > 0:
+                        extra += f" {C.RED}({t_crash} crash){C.RESET}"
+                    if t_mand > 0:
+                        extra += f" {C.RED}(bloquant){C.RESET}"
+
+                    clean_name = cat_name[:34].ljust(34)
+                    print(f"   [{badge}] {clean_name} {t_pass:2d}/{t_count:2d} ({t_pct:3.0f}%){extra}")
+
+        elif skills:
+            # Fallback sur skillBreakdowns si pas de détail disponible
+            print()
+            print(f"  {C.BOLD}{C.UNDER}Détails des compétences & tests :{C.RESET}")
+            for task_name, task_data in skills.items():
+                if not isinstance(task_data, dict):
+                    continue
+                t_count = task_data.get("count", 0)
+                t_pass = task_data.get("passed", 0)
+                t_crash = task_data.get("crashed", 0)
+                t_mand = task_data.get("mandatoryFailed", 0)
+
+                t_pct = (t_pass / t_count * 100.0) if t_count > 0 else 0
+                if t_crash > 0:
+                    badge = f"{C.RED}💥 CRASH{C.RESET}"
+                elif t_pass == t_count and t_count > 0:
+                    badge = f"{C.GREEN}✓ PASS  {C.RESET}"
+                elif t_pass > 0:
+                    badge = f"{C.YELLOW}~ PARTIEL{C.RESET}"
+                else:
+                    badge = f"{C.RED}✗ ÉCHEC {C.RESET}"
+
+                extra = ""
+                if t_crash > 0:
+                    extra += f" {C.RED}({t_crash} crash){C.RESET}"
+                if t_mand > 0:
+                    extra += f" {C.RED}(bloquant){C.RESET}"
+
+                clean_name = task_name[:34].ljust(34)
+                print(f"   [{badge}] {clean_name} {t_pass:2d}/{t_count:2d} ({t_pct:3.0f}%){extra}")
         else:
-            print(f"\n  {C.YELLOW}ℹ️  Aucun détail de test retourné pour ce run.{C.RESET}")
+            if "make-error" in failure_flags:
+                print(f"\n  {C.YELLOW}ℹ️  Aucun détail de test disponible : la moulinette a échoué à l'étape 'make'.{C.RESET}")
+                print(f"  {C.GRAY}   Vérifiez vos fichiers C, headers (.h) et Makefile puis repoussez un commit.{C.RESET}")
+            else:
+                print(f"\n  {C.YELLOW}ℹ️  Aucun détail de test retourné pour ce run.{C.RESET}")
     print()
 
 def display_list(results: list, limit: int = 10):
@@ -427,12 +525,22 @@ def watch_mode(cfg: dict, interval: int = 8):
                     sys.stdout.write("\a")
                     sys.stdout.flush()
                     print(f"{C.BOLD}{C.BG_GRN}{C.WHITE} 🔥 NOUVEAU VERDICT MOULINETTE DISPONIBLE ! 🔥 {C.RESET}")
-                    display_single_result(new_results[0], detailed=True)
+                    display_single_result(new_results[0], detailed=True, cfg=cfg)
                     last_id = current_id
                     last_date = current_date
                     print(f"{C.YELLOW}[*] Surveillance reprise. En attente du prochain run...{C.RESET}")
     except KeyboardInterrupt:
         print(f"\n{C.GRAY}[*] Surveillance arrêtée.{C.RESET}")
+
+def update_mouli():
+    print(f"{C.CYAN}[*] Mise à jour de MouliResult CLI vers la dernière version...{C.RESET}")
+    cmd = "curl -fsSL https://raw.githubusercontent.com/foundhack/mouli/main/install.sh | bash"
+    ret = os.system(cmd)
+    if ret == 0:
+        print(f"\n{C.GREEN}✓ MouliResult CLI a été mis à jour avec succès !{C.RESET}")
+    else:
+        print(f"\n{C.RED}Échec de la mise à jour.{C.RESET}", file=sys.stderr)
+    sys.exit(0 if ret == 0 else 1)
 
 # ============================================================
 #  POINT D'ENTRÉE PRINCIPAL
@@ -442,19 +550,25 @@ def main():
     parser = argparse.ArgumentParser(
         prog="mouli",
         description="MouliResult CLI - Affiche vos notes et retours de moulinette Epitech en direct dans votre terminal.",
-        epilog="Exemples :\n  mouli              # Affiche la dernière moulinette\n  mouli -w           # Mode surveillance en direct (examen)\n  mouli -l           # Liste les 10 dernières moulinettes\n  mouli corewar      # Cherche la dernière note du projet Corewar\n  mouli login        # Connecter son compte MyEpitech",
+        epilog="Exemples :\n  mouli              # Affiche la dernière moulinette\n  mouli -w           # Mode surveillance en direct (examen)\n  mouli -l           # Liste les 10 dernières moulinettes\n  mouli corewar      # Cherche la dernière note du projet Corewar\n  mouli login        # Connecter son compte MyEpitech\n  mouli update       # Mettre à jour vers la dernière version",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("query", nargs="?", default=None, help="Filtrer par nom de projet (ex: corewar, pushswap, tardis) ou 'login'")
+    parser.add_argument("query", nargs="?", default=None, help="Filtrer par nom de projet (ex: corewar, pushswap, tardis) ou commande ('login', 'update')")
     parser.add_argument("-w", "--watch", action="store_true", help="Surveiller en temps réel l'arrivée d'une nouvelle note (idéal en examen)")
     parser.add_argument("-l", "--list", action="store_true", help="Lister l'historique des notes récentes")
     parser.add_argument("-n", "--limit", type=int, default=10, help="Nombre de résultats à lister (par défaut 10)")
     parser.add_argument("--year", type=int, default=None, help="Changer l'année académique (ex: 2025)")
     parser.add_argument("--raw", action="store_true", help="Sortir le JSON brut (pour scripts / jq)")
     parser.add_argument("--login", type=str, nargs="?", const="", help="Définir un nouveau refresh_token")
+    parser.add_argument("--update", action="store_true", help="Mettre à jour MouliResult CLI")
 
     args = parser.parse_args()
     cfg = load_config()
+
+    # Raccourci update : 'mouli update' ou 'mouli --update'
+    if args.update or args.query == "update":
+        update_mouli()
+        return
 
     # Raccourci convivial : supporter 'mouli login [token]'
     if args.query == "login" and args.login is None:
@@ -524,7 +638,7 @@ def main():
         display_list(results, limit=args.limit)
     else:
         # Affiche la dernière moulinette
-        display_single_result(results[0], detailed=True)
+        display_single_result(results[0], detailed=True, cfg=cfg)
 
 if __name__ == "__main__":
     main()
