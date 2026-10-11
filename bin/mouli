@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MouliResult CLI (mouli) - Outil TTY & Terminal pour étudiants Epitech.
+Permet d'afficher instantanément le verdict de la dernière moulinette,
+de lister les rendus récents et de surveiller en direct les retours de tests.
+
+Auteur : Chamss-dine AGBIZOUNON (DineTech / foundhack) - Projet TekFlow
+"""
+
+import sys
+import os
+import json
+import time
+import gzip
+import ssl
+import argparse
+import base64
+from datetime import datetime, timezone, timedelta
+import urllib.request
+import urllib.error
+
+CONFIG_DIR = os.path.expanduser("~/.config/mouli")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+# ============================================================
+#  STYLES & COULEURS ANSI (Compatible TTY & Consoles Linux)
+# ============================================================
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
+
+class C:
+    RESET   = "\033[0m"  if USE_COLOR else ""
+    BOLD    = "\033[1m"  if USE_COLOR else ""
+    DIM     = "\033[2m"  if USE_COLOR else ""
+    UNDER   = "\033[4m"  if USE_COLOR else ""
+    RED     = "\033[91m" if USE_COLOR else ""
+    GREEN   = "\033[92m" if USE_COLOR else ""
+    YELLOW  = "\033[93m" if USE_COLOR else ""
+    BLUE    = "\033[94m" if USE_COLOR else ""
+    MAGENTA = "\033[95m" if USE_COLOR else ""
+    CYAN    = "\033[96m" if USE_COLOR else ""
+    WHITE   = "\033[97m" if USE_COLOR else ""
+    GRAY    = "\033[90m" if USE_COLOR else ""
+    BG_RED  = "\033[41m" if USE_COLOR else ""
+    BG_GRN  = "\033[42m" if USE_COLOR else ""
+
+# ============================================================
+#  GESTION DE LA CONFIGURATION
+# ============================================================
+
+def get_default_year() -> int:
+    now = datetime.now()
+    return now.year if now.month >= 8 else now.year - 1
+
+def load_config() -> dict:
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+
+    return {
+        "email": "",
+        "refresh_token": "",
+        "access_token": "",
+        "token_expires_at": 0,
+        "year": 2025
+    }
+
+def save_config(cfg: dict):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+    except Exception:
+        pass
+
+# ============================================================
+#  COMMUNICATION API MYEPITECH
+# ============================================================
+
+def make_request(url: str, data: dict = None, headers: dict = None) -> tuple:
+    req_headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip, deflate",
+        "User-Agent": "MouliCLI/1.0 (Epitech TTY Assistant)"
+    }
+    if headers:
+        req_headers.update(headers)
+
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+        req_headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=body, headers=req_headers)
+    ctx = ssl.create_default_context()
+
+    try:
+        with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
+            status = resp.status
+            raw = resp.read()
+            if resp.headers.get("Content-Encoding") == "gzip":
+                raw = gzip.decompress(raw)
+            try:
+                return status, json.loads(raw.decode("utf-8"))
+            except Exception:
+                return status, {}
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        if e.headers.get("Content-Encoding") == "gzip":
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+        try:
+            return e.code, json.loads(raw.decode("utf-8"))
+        except Exception:
+            return e.code, {}
+    except Exception as e:
+        print(f"{C.RED}[ERREUR RÉSEAU]{C.RESET} Impossible de contacter MyEpitech : {e}", file=sys.stderr)
+        return 0, {}
+
+def get_valid_access_token(cfg: dict) -> str:
+    now = int(time.time())
+    if cfg.get("access_token") and cfg.get("token_expires_at", 0) > (now + 60):
+        return cfg["access_token"]
+
+    rt = cfg.get("refresh_token")
+    if not rt:
+        print(f"{C.RED}[ERREUR]{C.RESET} Aucun refresh_token configuré.", file=sys.stderr)
+        print(f"Configurez votre compte en lançant : {C.CYAN}mouli login{C.RESET}", file=sys.stderr)
+        sys.exit(1)
+
+    status, resp = make_request("https://my.epitech.eu/api/auth/refresh", data={"refresh_token": rt})
+    if status in [200, 201] and "access_token" in resp:
+        acc = resp["access_token"]
+        # Décodage payload JWT
+        exp = now + 1800
+        try:
+            payload_b64 = acc.split(".")[1]
+            padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+            jwt_data = json.loads(base64.urlsafe_b64decode(padded.encode()))
+            exp = jwt_data.get("exp", exp)
+            if jwt_data.get("login"):
+                cfg["email"] = jwt_data.get("login")
+        except Exception:
+            pass
+
+        cfg["access_token"] = acc
+        cfg["token_expires_at"] = exp
+        if resp.get("refresh_token"):
+            cfg["refresh_token"] = resp["refresh_token"]
+        save_config(cfg)
+        return acc
+    else:
+        print(f"{C.RED}[EXPIRÉ]{C.RESET} Votre session MyEpitech a expiré ou le token est invalide.", file=sys.stderr)
+        print(f"Reconnectez-vous avec : {C.CYAN}mouli login <refresh_token>{C.RESET}", file=sys.stderr)
+        sys.exit(1)
+
+def fetch_moulinette_results(cfg: dict) -> list:
+    acc = get_valid_access_token(cfg)
+    year = cfg.get("year", 2025)
+    url = f"https://my.epitech.eu/api/students/test-results?year={year}"
+    status, resp = make_request(url, headers={"Authorization": f"Bearer {acc}"})
+
+    if status == 401:
+        # Forcer le refresh
+        cfg["access_token"] = ""
+        cfg["token_expires_at"] = 0
+        acc = get_valid_access_token(cfg)
+        status, resp = make_request(url, headers={"Authorization": f"Bearer {acc}"})
+
+    if status == 200:
+        results = resp.get("results", [])
+        # Tri antichronologique
+        results.sort(key=lambda x: x.get("properties", {}).get("date", ""), reverse=True)
+        return results
+    return []
+
+# ============================================================
+#  FORMATTAGE GRAPHIQUE CLI
+# ============================================================
+
+def make_bar(percent: float, width: int = 24) -> str:
+    filled = int(round(width * (percent / 100.0)))
+    filled = max(0, min(width, filled))
+    empty = width - filled
+
+    if percent >= 75:
+        bar_color = C.GREEN
+    elif percent >= 50:
+        bar_color = C.YELLOW
+    else:
+        bar_color = C.RED
+
+    return f"{bar_color}[{'█' * filled}{'░' * empty}]{C.RESET}"
+
+def format_date_relative(iso_str: str) -> str:
+    if not iso_str:
+        return "N/A"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        local_dt = dt.astimezone()
+        now = datetime.now(timezone.utc)
+        diff = now - dt
+
+        formatted = local_dt.strftime("%d/%m/%Y à %H:%M")
+        if diff.total_seconds() < 60:
+            rel = "il y a quelques secondes"
+        elif diff.total_seconds() < 3600:
+            m = int(diff.total_seconds() // 60)
+            rel = f"il y a {m} min"
+        elif diff.total_seconds() < 86400:
+            h = int(diff.total_seconds() // 3600)
+            rel = f"il y a {h}h"
+        else:
+            d = int(diff.total_seconds() // 86400)
+            rel = f"il y a {d}j"
+        return f"{formatted} ({C.CYAN}{rel}{C.RESET})"
+    except Exception:
+        return iso_str
+
+def display_single_result(res: dict, detailed: bool = True):
+    ctx = res.get("context", {})
+    prop = res.get("properties", {})
+    skills = res.get("skillBreakdowns", {})
+    style = res.get("codingStyle")
+    prereq = res.get("prerequisitesMark", None)
+    failure_flags = res.get("failureFlags", [])
+
+    title = ctx.get("title") or ctx.get("projectCode") or "Projet inconnu"
+    project_code = ctx.get("projectCode", "")
+    unit = ctx.get("unitCode", "")
+    commit = prop.get("commit", "")[:8]
+    date_str = format_date_relative(prop.get("date", ""))
+
+    total_tests = sum(v.get("count", 0) for v in skills.values() if isinstance(v, dict))
+    passed_tests = sum(v.get("passed", 0) for v in skills.values() if isinstance(v, dict))
+    crashed_tests = sum(v.get("crashed", 0) for v in skills.values() if isinstance(v, dict))
+    percent = (passed_tests / total_tests * 100.0) if total_tests > 0 else 0.0
+
+    print()
+    print(f"{C.BOLD}{C.CYAN}╭─────────────────────────────────────────────────────────────╮{C.RESET}")
+    print(f"{C.BOLD}{C.CYAN}│{C.RESET}  {C.BOLD}{C.WHITE}MOULIRESULT{C.RESET} • {C.BOLD}{C.MAGENTA}{title.upper()}{C.RESET} ({unit}/{project_code})")
+    print(f"{C.BOLD}{C.CYAN}╰─────────────────────────────────────────────────────────────╯{C.RESET}")
+
+    print(f"  {C.BOLD}Date de passage  :{C.RESET} {date_str}")
+    print(f"  {C.BOLD}Dernier Commit   :{C.RESET} {C.YELLOW}{commit}{C.RESET}")
+
+    # Statut compilation si make-error
+    if "make-error" in failure_flags:
+        print(f"  {C.BOLD}Compilation      :{C.RESET} {C.BG_RED}{C.WHITE} ÉCHEC (make-error) {C.RESET} {C.RED}Le projet n'a pas compilé sur la moulinette !{C.RESET}")
+        print(f"                     {C.YELLOW}↳ Aucun exécutable généré : aucun test n'a pu être exécuté (0/0).{C.RESET}")
+    elif total_tests > 0:
+        print(f"  {C.BOLD}Compilation      :{C.RESET} {C.GREEN}✓ Réussie{C.RESET}")
+
+    # Note globale & barre de progression
+    pct_color = C.GREEN if percent >= 75 else (C.YELLOW if percent >= 50 else C.RED)
+    bar_str = make_bar(percent, 22)
+    print(f"  {C.BOLD}Note Globale     :{C.RESET} {bar_str} {pct_color}{C.BOLD}{percent:5.1f}%{C.RESET} ({passed_tests}/{total_tests} tests)")
+
+    # Norme & Coding Style
+    if style and isinstance(style, dict):
+        val = style.get("value", {}) if isinstance(style.get("value"), dict) else {}
+        pen_raw = style.get("penalty", {})
+        penalty = 0
+        if isinstance(pen_raw, dict):
+            if "TooManyErrors" in pen_raw:
+                penalty = "Trop d'erreurs (bloquant)"
+            elif "Penalty" in pen_raw and isinstance(pen_raw["Penalty"], dict):
+                penalty = pen_raw["Penalty"].get("value", 0)
+        elif isinstance(pen_raw, (int, float)):
+            penalty = pen_raw
+        major = val.get("major", 0)
+        minor = val.get("minor", 0)
+        info = val.get("info", 0)
+        norm_color = C.GREEN if (major == 0 and minor == 0) else C.RED
+        print(f"  {C.BOLD}Coding Style     :{C.RESET} {norm_color}{major} maj{C.RESET}, {minor} min, {info} info (Pénalité: {C.RED}{penalty}{C.RESET})")
+    else:
+        print(f"  {C.BOLD}Coding Style     :{C.RESET} {C.GRAY}Non requis / Validé{C.RESET}")
+
+    # Prérequis
+    if prereq is not None:
+        prereq_color = C.GREEN if prereq >= 2 else C.RED
+        print(f"  {C.BOLD}Prérequis        :{C.RESET} {prereq_color}{prereq}/2{C.RESET}")
+
+    # Alertes / Flags d'échec
+    if failure_flags:
+        other_flags = []
+        for ff in failure_flags:
+            if ff == "make-error":
+                continue
+            elif ff == "no-test-passed":
+                other_flags.append(f"{C.RED}no-test-passed{C.RESET}")
+            elif ff == "coding-style-fail":
+                other_flags.append(f"{C.YELLOW}coding-style-fail{C.RESET}")
+            elif ff == "prerequisites-fail":
+                other_flags.append(f"{C.RED}prerequisites-fail{C.RESET}")
+            else:
+                other_flags.append(f"{C.RED}{ff}{C.RESET}")
+        if other_flags:
+            print(f"  {C.BOLD}Alertes Statut   :{C.RESET} {', '.join(other_flags)}")
+
+    # Crashes
+    if crashed_tests > 0:
+        print(f"  {C.BOLD}Alertes Crash    :{C.RESET} {C.BG_RED}{C.WHITE} {crashed_tests} CRASH(S) DÉTECTÉ(S) {C.RESET}")
+
+    # Détails des tests
+    if detailed and skills:
+        print()
+        print(f"  {C.BOLD}{C.UNDER}Détails des compétences & tests :{C.RESET}")
+        for task_name, task_data in skills.items():
+            if not isinstance(task_data, dict):
+                continue
+            t_count = task_data.get("count", 0)
+            t_pass = task_data.get("passed", 0)
+            t_crash = task_data.get("crashed", 0)
+            t_mand = task_data.get("mandatoryFailed", 0)
+
+            t_pct = (t_pass / t_count * 100.0) if t_count > 0 else 0
+            if t_crash > 0:
+                badge = f"{C.RED}💥 CRASH{C.RESET}"
+            elif t_pass == t_count and t_count > 0:
+                badge = f"{C.GREEN}✓ PASS  {C.RESET}"
+            elif t_pass > 0:
+                badge = f"{C.YELLOW}~ PARTIEL{C.RESET}"
+            else:
+                badge = f"{C.RED}✗ ÉCHEC {C.RESET}"
+
+            extra = ""
+            if t_crash > 0:
+                extra += f" {C.RED}({t_crash} crash){C.RESET}"
+            if t_mand > 0:
+                extra += f" {C.RED}(bloquant){C.RESET}"
+
+            clean_name = task_name[:34].ljust(34)
+            print(f"   [{badge}] {clean_name} {t_pass:2d}/{t_count:2d} ({t_pct:3.0f}%){extra}")
+    elif detailed and not skills:
+        if "make-error" in failure_flags:
+            print(f"\n  {C.YELLOW}ℹ️  Aucun détail de test disponible : la moulinette a échoué à l'étape 'make'.{C.RESET}")
+            print(f"  {C.GRAY}   Vérifiez vos fichiers C, headers (.h) et Makefile puis repoussez un commit.{C.RESET}")
+        else:
+            print(f"\n  {C.YELLOW}ℹ️  Aucun détail de test retourné pour ce run.{C.RESET}")
+    print()
+
+def display_list(results: list, limit: int = 10):
+    if not results:
+        print(f"{C.YELLOW}Aucune moulinette trouvée pour l'année en cours.{C.RESET}")
+        return
+
+    print()
+    print(f"{C.BOLD}{C.CYAN}=== DERNIÈRES MOULINETTES MYEPITECH ==={C.RESET}")
+    print(f"{C.BOLD}{'DATE':<17} {'PROJET':<22} {'NOTE':<12} {'CRASH':<7} {'COMMIT'}{C.RESET}")
+    print("─" * 70)
+
+    for res in results[:limit]:
+        ctx = res.get("context", {})
+        prop = res.get("properties", {})
+        skills = res.get("skillBreakdowns", {})
+        failure_flags = res.get("failureFlags", [])
+
+        title = (ctx.get("title") or ctx.get("projectCode") or "N/A")[:20]
+        commit = prop.get("commit", "")[:7]
+        raw_date = prop.get("date", "")
+        short_date = raw_date[:10] + " " + raw_date[11:16] if raw_date else "N/A"
+
+        total_tests = sum(v.get("count", 0) for v in skills.values() if isinstance(v, dict))
+        passed_tests = sum(v.get("passed", 0) for v in skills.values() if isinstance(v, dict))
+        crashed = sum(v.get("crashed", 0) for v in skills.values() if isinstance(v, dict))
+        pct = (passed_tests / total_tests * 100.0) if total_tests > 0 else 0.0
+
+        if "make-error" in failure_flags:
+            pct_str = f"{C.BG_RED}{C.WHITE} MAKE-ERR {C.RESET}"
+        elif total_tests == 0:
+            pct_str = f"{C.GRAY} 0.0% (0) {C.RESET}"
+        else:
+            pct_color = C.GREEN if pct >= 75 else (C.YELLOW if pct >= 50 else C.RED)
+            pct_str = f"{pct_color}{pct:5.1f}%{C.RESET}    "
+
+        crash_str = f"{C.RED}{crashed}{C.RESET}" if crashed > 0 else f"{C.GRAY}0{C.RESET}"
+
+        print(f"{short_date:<17} {title:<22} {pct_str}  {crash_str:<16} {C.YELLOW}{commit}{C.RESET}")
+    print()
+
+# ============================================================
+#  MODE SURVEILLANCE / WATCH (IDÉAL EN EXAMEN)
+# ============================================================
+
+def watch_mode(cfg: dict, interval: int = 8):
+    print(f"{C.BOLD}{C.CYAN}╔════════════════════════════════════════════════════════════╗{C.RESET}")
+    print(f"{C.BOLD}{C.CYAN}║     MODE SURVEILLANCE ACTIF (EXAMEN & RENDUS EN DIRECT)    ║{C.RESET}")
+    print(f"{C.BOLD}{C.CYAN}╚════════════════════════════════════════════════════════════╝{C.RESET}")
+    print(f"{C.GRAY}Actualisation toutes les {interval}s. Appuyez sur Ctrl+C pour quitter.{C.RESET}\n")
+
+    results = fetch_moulinette_results(cfg)
+    last_id = results[0].get("id") if results else None
+    last_date = results[0].get("properties", {}).get("date") if results else None
+
+    if results:
+        title = results[0].get("context", {}).get("title")
+        print(f"[*] Dernier verdict en base : {C.BOLD}{title}{C.RESET} ({last_date})")
+    print(f"{C.YELLOW}[*] En attente d'une nouvelle moulinette...{C.RESET}")
+
+    spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    spin_idx = 0
+
+    try:
+        while True:
+            for _ in range(interval * 2):
+                sys.stdout.write(f"\r{C.CYAN}{spinner[spin_idx % len(spinner)]}{C.RESET} Écoute des serveurs MyEpitech... ")
+                sys.stdout.flush()
+                spin_idx += 1
+                time.sleep(0.5)
+
+            new_results = fetch_moulinette_results(cfg)
+            if new_results:
+                current_id = new_results[0].get("id")
+                current_date = new_results[0].get("properties", {}).get("date")
+
+                if current_id != last_id or current_date != last_date:
+                    sys.stdout.write("\r" + " " * 50 + "\r")
+                    # Cloche sonore de terminal (BEEP)
+                    sys.stdout.write("\a")
+                    sys.stdout.flush()
+                    print(f"{C.BOLD}{C.BG_GRN}{C.WHITE} 🔥 NOUVEAU VERDICT MOULINETTE DISPONIBLE ! 🔥 {C.RESET}")
+                    display_single_result(new_results[0], detailed=True)
+                    last_id = current_id
+                    last_date = current_date
+                    print(f"{C.YELLOW}[*] Surveillance reprise. En attente du prochain run...{C.RESET}")
+    except KeyboardInterrupt:
+        print(f"\n{C.GRAY}[*] Surveillance arrêtée.{C.RESET}")
+
+# ============================================================
+#  POINT D'ENTRÉE PRINCIPAL
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="mouli",
+        description="MouliResult CLI - Affiche vos notes et retours de moulinette Epitech en direct dans votre terminal.",
+        epilog="Exemples :\n  mouli              # Affiche la dernière moulinette\n  mouli -w           # Mode surveillance en direct (examen)\n  mouli -l           # Liste les 10 dernières moulinettes\n  mouli corewar      # Cherche la dernière note du projet Corewar\n  mouli login        # Connecter son compte MyEpitech",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("query", nargs="?", default=None, help="Filtrer par nom de projet (ex: corewar, pushswap, tardis) ou 'login'")
+    parser.add_argument("-w", "--watch", action="store_true", help="Surveiller en temps réel l'arrivée d'une nouvelle note (idéal en examen)")
+    parser.add_argument("-l", "--list", action="store_true", help="Lister l'historique des notes récentes")
+    parser.add_argument("-n", "--limit", type=int, default=10, help="Nombre de résultats à lister (par défaut 10)")
+    parser.add_argument("--year", type=int, default=None, help="Changer l'année académique (ex: 2025)")
+    parser.add_argument("--raw", action="store_true", help="Sortir le JSON brut (pour scripts / jq)")
+    parser.add_argument("--login", type=str, nargs="?", const="", help="Définir un nouveau refresh_token")
+
+    args = parser.parse_args()
+    cfg = load_config()
+
+    # Raccourci convivial : supporter 'mouli login [token]'
+    if args.query == "login" and args.login is None:
+        args.login = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("-") else ""
+        args.query = None
+
+    if args.login is not None:
+        token = args.login.strip()
+        if not token:
+            print(f"{C.CYAN}=== CONNEXION MYEPITECH ==={C.RESET}")
+            print(f"{C.GRAY}Récupérez votre refresh_token sur my.epitech.eu (DevTools F12 -> Application -> Cookies/Storage){C.RESET}\n")
+            try:
+                token = input("Collez votre refresh_token MyEpitech : ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nAnnulé.")
+                return
+        if token:
+            cfg["refresh_token"] = token
+            cfg["access_token"] = ""
+            cfg["token_expires_at"] = 0
+            save_config(cfg)
+            print(f"{C.GREEN}✓ Refresh token enregistré dans {CONFIG_FILE}{C.RESET}")
+            # Tester immédiatement la connexion
+            try:
+                acc = get_valid_access_token(cfg)
+                user_desc = cfg.get("email") or "étudiant"
+                print(f"{C.GREEN}✓ Connexion réussie ! Session active pour {C.BOLD}{user_desc}{C.RESET}")
+            except SystemExit:
+                pass
+        else:
+            print(f"{C.RED}[ERREUR]{C.RESET} Aucun token saisi.", file=sys.stderr)
+        return
+
+    if args.year:
+        cfg["year"] = args.year
+        save_config(cfg)
+        print(f"{C.GREEN}✓ Année académique configurée sur {args.year}{C.RESET}")
+
+    if args.watch:
+        watch_mode(cfg)
+        return
+
+    results = fetch_moulinette_results(cfg)
+    if not results:
+        print(f"{C.YELLOW}Aucun résultat disponible sur MyEpitech pour l'année {cfg.get('year', 2025)}.{C.RESET}")
+        return
+
+    # Si filtrage par projet
+    if args.query:
+        q = args.query.lower().strip()
+        matches = [
+            r for r in results
+            if q in (r.get("context", {}).get("title") or "").lower()
+            or q in (r.get("context", {}).get("projectCode") or "").lower()
+            or q in (r.get("context", {}).get("unitCode") or "").lower()
+        ]
+        if not matches:
+            print(f"{C.RED}Aucun projet correspondant à '{args.query}' trouvé.{C.RESET}")
+            return
+        results = matches
+
+    if args.raw:
+        print(json.dumps(results[0] if not args.list else results[:args.limit], indent=2))
+        return
+
+    if args.list:
+        display_list(results, limit=args.limit)
+    else:
+        # Affiche la dernière moulinette
+        display_single_result(results[0], detailed=True)
+
+if __name__ == "__main__":
+    main()
